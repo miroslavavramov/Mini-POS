@@ -9,6 +9,8 @@
 # 2. Send a sale request from another terminal:
 #   ./posgw sale --amount 12.34 --host 127.0.0.1 --port 9000
 # ./posgw sale --amount 75.00 --host 127.0.0.1 --port 9000
+# 3. View last transactions:
+#   ./posgw last --n 5
 
 # OPI-Lite Protocol:
 # - Handshake:

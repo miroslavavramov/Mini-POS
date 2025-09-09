@@ -89,6 +89,74 @@ public:
                   << amount << ", Approved=" << (approved ? "true" : "false") << std::endl;
         return true;
     }
+
+    bool getLastTransactions(int n) {
+        const char* sql = R"(
+            SELECT id, amount, approved, auth_code, masked_pan, rrn, unix_ts, nonce 
+            FROM transactions 
+            ORDER BY id DESC 
+            LIMIT ?;
+        )";
+        
+        sqlite3_stmt* stmt;
+        int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            std::cerr << "Failed to prepare statement: " << sqlite3_errmsg(db) << std::endl;
+            return false;
+        }
+
+        sqlite3_bind_int(stmt, 1, n);
+
+        std::cout << "\nLast " << n << " transactions:" << std::endl;
+        std::cout << std::string(80, '=') << std::endl;
+        std::cout << std::left << std::setw(4) << "ID" 
+                  << std::setw(10) << "Amount" 
+                  << std::setw(10) << "Status"
+                  << std::setw(8) << "Auth"
+                  << std::setw(18) << "Masked PAN"
+                  << std::setw(14) << "RRN"
+                  << std::setw(12) << "Timestamp"
+                  << "Nonce" << std::endl;
+        std::cout << std::string(80, '-') << std::endl;
+
+        int count = 0;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            int id = sqlite3_column_int(stmt, 0);
+            double amount = sqlite3_column_double(stmt, 1);
+            bool approved = sqlite3_column_int(stmt, 2) != 0;
+            const char* auth_code = (const char*)sqlite3_column_text(stmt, 3);
+            const char* masked_pan = (const char*)sqlite3_column_text(stmt, 4);
+            const char* rrn = (const char*)sqlite3_column_text(stmt, 5);
+            long unix_ts = sqlite3_column_int64(stmt, 6);
+            const char* nonce = (const char*)sqlite3_column_text(stmt, 7);
+
+            std::cout << std::left << std::setw(4) << id 
+                      << "$" << std::setw(8) << std::fixed << std::setprecision(2) << amount
+                      << std::setw(10) << (approved ? "APPROVED" : "DECLINED")
+                      << std::setw(8) << (auth_code ? auth_code : "")
+                      << std::setw(18) << (masked_pan ? masked_pan : "")
+                      << std::setw(14) << (rrn ? rrn : "")
+                      << std::setw(12) << unix_ts
+                      << (nonce ? nonce : "") << std::endl;
+            count++;
+        }
+
+        sqlite3_finalize(stmt);
+
+        if (rc != SQLITE_DONE) {
+            std::cerr << "Error reading transactions: " << sqlite3_errmsg(db) << std::endl;
+            return false;
+        }
+
+        if (count == 0) {
+            std::cout << "No transactions found in database." << std::endl;
+        } else {
+            std::cout << std::string(80, '=') << std::endl;
+            std::cout << "Total: " << count << " transaction(s) displayed" << std::endl;
+        }
+
+        return true;
+    }
 };
 
 std::string generateNonce() {
@@ -97,7 +165,7 @@ std::string generateNonce() {
     std::uniform_int_distribution<> dis(0, 15);
     
     std::string nonce;
-    int length = 8 + (gen() % 9); 
+    int length = 8 + (gen() % 9);
     
     for (int i = 0; i < length; i++) {
         int val = dis(gen);
@@ -167,11 +235,11 @@ public:
         }
     }
 
-    bool start() {   
+    bool start() {
         if (!db.init()) {
             std::cerr << "Failed to initialize database" << std::endl;
             return false;
-        }
+        }     
         server_socket = socket(AF_INET, SOCK_STREAM, 0);
         if (server_socket == -1) {
             std::cerr << "Failed to create socket" << std::endl;
@@ -229,7 +297,7 @@ private:
             if (c == '\n') {
                 break;
             }
-            if (c != '\r') { // Strip \r
+            if (c != '\r') { 
                 line += c;
             }
         }
@@ -579,10 +647,12 @@ void printUsage(const char* program_name) {
     std::cout << "Commands:" << std::endl;
     std::cout << "  server --port <port>                    Start payment gateway terminal" << std::endl;
     std::cout << "  sale --amount <amount> --host <host> --port <port>  Send sale request" << std::endl;
+    std::cout << "  last --n <count>                        Show last N transactions from database" << std::endl;
     std::cout << std::endl;
     std::cout << "Examples:" << std::endl;
     std::cout << "  " << program_name << " server --port 9000" << std::endl;
     std::cout << "  " << program_name << " sale --amount 12.34 --host 127.0.0.1 --port 9000" << std::endl;
+    std::cout << "  " << program_name << " last --n 5" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -618,7 +688,6 @@ int main(int argc, char* argv[]) {
             printUsage(argv[0]);
             return 1;
         }
-        
         PaymentGatewayServer server(port);
         if (!server.start()) {
             return 1;
@@ -662,6 +731,39 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         
+    } else if (command == "last"){
+        int n = 10;
+        
+        for (int i = 2; i < argc; i += 2){
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for option: " << argv[i] << std::endl;
+                return 1;
+            }
+            
+            std::string option = argv[i];
+            std::string value = argv[i + 1];
+            
+            if (option == "--n"){
+                n = std::stoi(value);
+                if (n <= 0) {
+                    std::cerr << "Number of transactions must be positive" << std::endl;
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown option for last command: " << option << std::endl;
+                return 1;
+            }
+        }
+        
+        TransactionDB db;
+        if (!db.init()){
+            std::cerr << "Failed to initialize database" << std::endl;
+            return 1;
+        }
+        
+        if (!db.getLastTransactions(n)){
+            return 1;
+        }        
     } else {
         std::cerr << "Unknown command: " << command << std::endl;
         printUsage(argv[0]);
