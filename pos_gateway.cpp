@@ -7,11 +7,78 @@
 #include <sstream>
 #include <iomanip>
 #include <getopt.h>
+#include <sqlite3.h>
+
+class TransactionDB {
+private:
+    sqlite3* db;
+
+public:
+    TransactionDB() : db(nullptr) {}
+
+    ~TransactionDB() {
+        if (db) {
+            sqlite3_close(db);
+        }
+    }
+
+    bool init(const std::string& db_path = "transactions.db") {
+        int rc = sqlite3_open(db_path.c_str(), &db);
+        if (rc) {
+            std::cerr << "Can't open database: " << sqlite3_errmsg(db) << std::endl;
+            return false;
+        }
+
+        const char* sql = R"(
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                amount REAL NOT NULL,
+                approved BOOLEAN NOT NULL
+            );
+        )";
+
+        rc = sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
+        if (rc != SQLITE_OK) {
+            std::cerr << "Can't create table: " << sqlite3_errmsg(db) << std::endl;
+            return false;
+        }
+
+        std::cout << "Database initialized successfully" << std::endl;
+        return true;
+    }
+
+    bool insertTransaction(double amount, bool approved) {
+        const char* sql = "INSERT INTO transactions (amount, approved) VALUES (?, ?);";
+        sqlite3_stmt* stmt;
+
+        int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            std::cerr << "Failed to prepare statement: " << sqlite3_errmsg(db) << std::endl;
+            return false;
+        }
+
+        sqlite3_bind_double(stmt, 1, amount);
+        sqlite3_bind_int(stmt, 2, approved ? 1 : 0);
+
+        rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+
+        if (rc != SQLITE_DONE) {
+            std::cerr << "Failed to insert transaction: " << sqlite3_errmsg(db) << std::endl;
+            return false;
+        }
+
+        std::cout << "Transaction stored: Amount=$" << std::fixed << std::setprecision(2) 
+                  << amount << ", Approved=" << (approved ? "true" : "false") << std::endl;
+        return true;
+    }
+};
 
 class PaymentGatewayServer {
 private:
     int server_socket;
     int port;
+    TransactionDB db;
 
 public:
     PaymentGatewayServer(int port) : port(port), server_socket(-1) {}
@@ -23,6 +90,10 @@ public:
     }
 
     bool start() {
+        if (!db.init()) {
+            std::cerr << "Failed to initialize database" << std::endl;
+            return false;
+        }
         server_socket = socket(AF_INET, SOCK_STREAM, 0);
         if (server_socket == -1) {
             std::cerr << "Failed to create socket" << std::endl;
@@ -88,12 +159,23 @@ private:
                 std::string amount_str = request.substr(5);
                 double amount = std::stod(amount_str);
                 
-                usleep(100000); 
+                bool approved = amount < 50.5;
                 
-                std::ostringstream oss;
-                oss << "SUCCESS:Transaction approved for $" << std::fixed << std::setprecision(2) << amount 
-                    << ":TXN_ID_" << std::time(nullptr);
-                response = oss.str();
+                if (!db.insertTransaction(amount, approved)) {
+                    response = "ERROR:Database error";
+                } else {
+                    usleep(100000); 
+                    
+                    std::ostringstream oss;
+                    if (approved) {
+                        oss << "SUCCESS:Transaction approved for $" << std::fixed << std::setprecision(2) << amount 
+                            << ":TXN_ID_" << std::time(nullptr);
+                    } else {
+                        oss << "DECLINED:Amount $" << std::fixed << std::setprecision(2) << amount 
+                            << " exceeds limit (50.50):TXN_ID_" << std::time(nullptr);
+                    }
+                    response = oss.str();
+                }
             } else {
                 response = "ERROR:Invalid request format";
             }
