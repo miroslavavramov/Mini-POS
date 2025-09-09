@@ -8,6 +8,11 @@
 #include <iomanip>
 #include <getopt.h>
 #include <sqlite3.h>
+#include <random>
+#include <chrono>
+#include <thread>
+#include <fcntl.h>
+#include <errno.h>
 
 class TransactionDB {
 private:
@@ -33,7 +38,12 @@ public:
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 amount REAL NOT NULL,
-                approved BOOLEAN NOT NULL
+                approved BOOLEAN NOT NULL,
+                auth_code TEXT,
+                masked_pan TEXT,
+                rrn TEXT,
+                unix_ts INTEGER,
+                nonce TEXT
             );
         )";
 
@@ -47,8 +57,10 @@ public:
         return true;
     }
 
-    bool insertTransaction(double amount, bool approved) {
-        const char* sql = "INSERT INTO transactions (amount, approved) VALUES (?, ?);";
+    bool insertTransaction(double amount, bool approved, const std::string& auth_code = "", 
+                          const std::string& masked_pan = "", const std::string& rrn = "",
+                          long unix_ts = 0, const std::string& nonce = "") {
+        const char* sql = "INSERT INTO transactions (amount, approved, auth_code, masked_pan, rrn, unix_ts, nonce) VALUES (?, ?, ?, ?, ?, ?, ?);";
         sqlite3_stmt* stmt;
 
         int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
@@ -59,6 +71,11 @@ public:
 
         sqlite3_bind_double(stmt, 1, amount);
         sqlite3_bind_int(stmt, 2, approved ? 1 : 0);
+        sqlite3_bind_text(stmt, 3, auth_code.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 4, masked_pan.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 5, rrn.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 6, unix_ts);
+        sqlite3_bind_text(stmt, 7, nonce.c_str(), -1, SQLITE_STATIC);
 
         rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
@@ -73,6 +90,67 @@ public:
         return true;
     }
 };
+
+std::string generateNonce() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 15);
+    
+    std::string nonce;
+    int length = 8 + (gen() % 9); 
+    
+    for (int i = 0; i < length; i++) {
+        int val = dis(gen);
+        nonce += (val < 10) ? ('0' + val) : ('A' + val - 10);
+    }
+    
+    return nonce;
+}
+
+std::string generateAuthCode() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(100000, 999999);
+    return std::to_string(dis(gen));
+}
+
+std::string generateMaskedPAN() {
+    return "****-****-****-1234";
+}
+
+std::string generateRRN() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<long long> dis(100000000000LL, 999999999999LL);
+    return std::to_string(dis(gen));
+}
+
+long getCurrentUnixTimestamp() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+bool setSocketTimeout(int socket, int timeout_ms) {
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    
+    if (setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        return false;
+    }
+    if (setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+        return false;
+    }
+    return true;
+}
+
+std::string stripCR(const std::string& str) {
+    std::string result = str;
+    if (!result.empty() && result.back() == '\r') {
+        result.pop_back();
+    }
+    return result;
+}
 
 class PaymentGatewayServer {
 private:
@@ -89,7 +167,7 @@ public:
         }
     }
 
-    bool start() {
+    bool start() {   
         if (!db.init()) {
             std::cerr << "Failed to initialize database" << std::endl;
             return false;
@@ -112,7 +190,8 @@ public:
         server_addr.sin_port = htons(port);
 
         if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-            std::cerr << "Bind failed" << std::endl;
+            std::cerr << "Bind failed on port " << port << ": " << strerror(errno) << std::endl;
+            std::cerr << "Port may already be in use. Try a different port or wait a moment." << std::endl;
             return false;
         }
 
@@ -121,7 +200,7 @@ public:
             return false;
         }
 
-        std::cout << "Payment Gateway Server listening on port " << port << std::endl;
+        std::cout << "Payment Gateway Terminal listening on port " << port << std::endl;
         return true;
     }
 
@@ -136,114 +215,369 @@ public:
                 continue;
             }
 
+            setSocketTimeout(client_socket, 3000); 
+
             handleClient(client_socket);
         }
     }
 
 private:
-    void handleClient(int client_socket) {
-        char buffer[1024] = {0};
-        
-        ssize_t bytes_received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
-        if (bytes_received <= 0) {
-            close(client_socket);
-            return;
+    std::string readLine(int socket) {
+        std::string line;
+        char c;
+        while (recv(socket, &c, 1, 0) == 1) {
+            if (c == '\n') {
+                break;
+            }
+            if (c != '\r') { // Strip \r
+                line += c;
+            }
         }
+        return line;
+    }
 
-        std::string request(buffer, bytes_received);
-        std::cout << "Received payment request: " << request << std::endl;
+    bool sendLine(int socket, const std::string& line) {
+        std::string message = line + "\n";
+        return send(socket, message.c_str(), message.length(), 0) >= 0;
+    }
 
-        std::string response;
+    void handleClient(int client_socket) {
+        std::cout << "Client connected, waiting for handshake..." << std::endl;
+
         try {
-            if (request.substr(0, 5) == "SALE:") {
-                std::string amount_str = request.substr(5);
-                double amount = std::stod(amount_str);
+            std::string hello_msg = readLine(client_socket);
+            hello_msg = stripCR(hello_msg);
+            std::cout << "Received: " << hello_msg << std::endl;
+
+            if (hello_msg != "HELLO|GW|1.0") {
+                std::cerr << "Invalid handshake received: " << hello_msg << std::endl;
+                close(client_socket);
+                return;
+            }
+
+            if (!sendLine(client_socket, "HELLO|TERM|1.0")) {
+                std::cerr << "Failed to send terminal hello" << std::endl;
+                close(client_socket);
+                return;
+            }
+
+            std::cout << "Handshake completed, waiting for AUTH..." << std::endl;
+
+            while (true) {
+                std::string request = readLine(client_socket);
+                request = stripCR(request);
                 
-                bool approved = amount < 50.5;
-                
-                if (!db.insertTransaction(amount, approved)) {
-                    response = "ERROR:Database error";
-                } else {
-                    usleep(100000); 
-                    
-                    std::ostringstream oss;
-                    if (approved) {
-                        oss << "SUCCESS:Transaction approved for $" << std::fixed << std::setprecision(2) << amount 
-                            << ":TXN_ID_" << std::time(nullptr);
-                    } else {
-                        oss << "DECLINED:Amount $" << std::fixed << std::setprecision(2) << amount 
-                            << " exceeds limit (50.50):TXN_ID_" << std::time(nullptr);
-                    }
-                    response = oss.str();
+                if (request.empty()) {
+                    break;
                 }
-            } else {
-                response = "ERROR:Invalid request format";
+
+                std::cout << "Received: " << request << std::endl;
+
+                if (request == "PING") {
+                    if (!sendLine(client_socket, "PONG")) {
+                        std::cerr << "Failed to send PONG" << std::endl;
+                        break;
+                    }
+                    std::cout << "Sent: PONG" << std::endl;
+                    continue;
+                }
+
+                if (request.substr(0, 5) == "AUTH|") {
+                    std::string response = processAuthRequest(request);
+                    if (!sendLine(client_socket, response)) {
+                        std::cerr << "Failed to send response" << std::endl;
+                        break;
+                    }
+                    std::cout << "Sent: " << response << std::endl;
+                } else {
+                    std::string response = "DECLINED|Invalid request format";
+                    if (!sendLine(client_socket, response)) {
+                        std::cerr << "Failed to send error response" << std::endl;
+                        break;
+                    }
+                    std::cout << "Sent: " << response << std::endl;
+                }
             }
         } catch (const std::exception& e) {
-            response = "ERROR:Invalid amount format";
+            std::cerr << "Exception in handleClient: " << e.what() << std::endl;
         }
 
-        send(client_socket, response.c_str(), response.length(), 0);
-        std::cout << "Sent response: " << response << std::endl;
-        
         close(client_socket);
+        std::cout << "Client disconnected" << std::endl;
+    }
+
+    std::string processAuthRequest(const std::string& request) {
+        try {
+            std::cout << "Processing AUTH request: " << request << std::endl;
+            
+            std::vector<std::string> parts;
+            std::stringstream ss(request);
+            std::string part;
+            
+            while (std::getline(ss, part, '|')) {
+                parts.push_back(part);
+            }
+
+            std::cout << "Parsed " << parts.size() << " parts" << std::endl;
+            
+            if (parts.size() != 4 || parts[0] != "AUTH") {
+                std::cout << "Invalid AUTH format - expected 4 parts, got " << parts.size() << std::endl;
+                return "DECLINED|Invalid AUTH format";
+            }
+
+            std::cout << "Parts: [" << parts[0] << "] [" << parts[1] << "] [" << parts[2] << "] [" << parts[3] << "]" << std::endl;
+
+            double amount;
+            long unix_ts;
+            try {
+                amount = std::stod(parts[1]);
+                unix_ts = std::stol(parts[2]);
+            } catch (const std::exception& e) {
+                std::cout << "Failed to parse amount or timestamp: " << e.what() << std::endl;
+                return "DECLINED|Invalid amount or timestamp format";
+            }
+            
+            std::string nonce = parts[3];
+
+            std::cout << "Parsed values: amount=" << amount << ", unix_ts=" << unix_ts << ", nonce=" << nonce << std::endl;
+
+            if (nonce.length() < 8 || nonce.length() > 16) {
+                std::cout << "Invalid nonce length: " << nonce.length() << std::endl;
+                return "DECLINED|Invalid nonce length";
+            }
+            for (char c : nonce) {
+                if (!std::isxdigit(c)) {
+                    std::cout << "Invalid nonce character: " << c << std::endl;
+                    return "DECLINED|Invalid nonce format";
+                }
+            }
+
+            bool approved = amount < 50.5;
+            std::cout << "Transaction approved: " << (approved ? "true" : "false") << std::endl;
+            
+            std::string response;
+            if (approved) {
+                std::string auth_code = generateAuthCode();
+                std::string masked_pan = generateMaskedPAN();
+                std::string rrn = generateRRN();
+                
+                std::cout << "Generated: auth_code=" << auth_code << ", masked_pan=" << masked_pan << ", rrn=" << rrn << std::endl;
+                
+                std::cout << "Storing approved transaction..." << std::endl;
+                if (!db.insertTransaction(amount, approved, auth_code, masked_pan, rrn, unix_ts, nonce)) {
+                    std::cout << "Database insert failed" << std::endl;
+                    return "DECLINED|Database error";
+                }
+                
+                std::ostringstream oss;
+                oss << "APPROVED|" << auth_code << "|" << masked_pan << "|" << rrn;
+                response = oss.str();
+            } else {
+                std::cout << "Storing declined transaction..." << std::endl;
+                if (!db.insertTransaction(amount, approved, "", "", "", unix_ts, nonce)) {
+                    std::cout << "Database insert failed for declined transaction" << std::endl;
+                }
+                
+                std::ostringstream oss;
+                oss << "DECLINED|Amount $" << std::fixed << std::setprecision(2) 
+                    << amount << " exceeds limit ($50.50)";
+                response = oss.str();
+            }
+
+            std::cout << "Generated response: " << response << std::endl;
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            
+            return response;
+            
+        } catch (const std::exception& e) {
+            std::cout << "Exception in processAuthRequest: " << e.what() << std::endl;
+            return std::string("DECLINED|Processing error: ") + e.what();
+        }
     }
 };
 
 class POSGatewayClient {
-public:
-    static bool sendSaleRequest(const std::string& host, int port, double amount) {
+private:
+    std::string host;
+    int port;
+
+    int createConnectedSocket(int timeout_ms = 2000) {
         int client_socket = socket(AF_INET, SOCK_STREAM, 0);
         if (client_socket == -1) {
-            std::cerr << "Failed to create socket" << std::endl;
-            return false;
+            return -1;
         }
+
+        setSocketTimeout(client_socket, timeout_ms);
 
         sockaddr_in server_addr{};
         server_addr.sin_family = AF_INET;
         server_addr.sin_port = htons(port);
         
         if (inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr) <= 0) {
-            std::cerr << "Invalid address: " << host << std::endl;
             close(client_socket);
-            return false;
+            return -1;
         }
 
         if (connect(client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-            std::cerr << "Connection failed to " << host << ":" << port << std::endl;
             close(client_socket);
-            return false;
+            return -1;
         }
 
-        std::ostringstream request;
-        request << "SALE:" << std::fixed << std::setprecision(2) << amount;
-        std::string request_str = request.str();
+        return client_socket;
+    }
+
+    std::string readLine(int socket) {
+        std::string line;
+        char c;
+        while (recv(socket, &c, 1, 0) == 1) {
+            if (c == '\n') {
+                break;
+            }
+            if (c != '\r') { 
+                line += c;
+            }
+        }
+        return line;
+    }
+
+    bool sendLine(int socket, const std::string& line) {
+        std::string message = line + "\n";
+        return send(socket, message.c_str(), message.length(), 0) >= 0;
+    }
+
+    bool performHandshake(int socket) {
+        if (!sendLine(socket, "HELLO|GW|1.0")) {
+            return false;
+        }
+        std::cout << "Sent: HELLO|GW|1.0" << std::endl;
+
+        std::string response = readLine(socket);
+        response = stripCR(response);
+        std::cout << "Received: " << response << std::endl;
+
+        return response == "HELLO|TERM|1.0";
+    }
+
+public:
+    POSGatewayClient(const std::string& host, int port) : host(host), port(port) {}
+
+    bool sendSaleRequest(double amount) {
+        int retries = 0;
+        const int max_retries = 2;
         
-        if (send(client_socket, request_str.c_str(), request_str.length(), 0) < 0) {
-            std::cerr << "Send failed" << std::endl;
+        while (retries <= max_retries) {
+            int client_socket = createConnectedSocket();
+            if (client_socket == -1) {
+                std::cerr << "Connection failed to " << host << ":" << port;
+                if (retries < max_retries) {
+                    int delay_ms = 200 * (1 << retries); 
+                    std::cerr << ", retrying in " << delay_ms << "ms..." << std::endl;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                    retries++;
+                    continue;
+                } else {
+                    std::cerr << ", giving up after " << max_retries << " retries" << std::endl;
+                    return false;
+                }
+            }
+
+            setSocketTimeout(client_socket, 3000); 
+
+            bool success = false;
+            try {
+                if (!performHandshake(client_socket)) {
+                    std::cerr << "Handshake failed" << std::endl;
+                    close(client_socket);
+                    
+                    if (retries == 0) {
+                        std::cout << "Server dropped connection after HELLO, retrying..." << std::endl;
+                        retries++;
+                        continue;
+                    } else {
+                        return false;
+                    }
+                }
+
+                long unix_ts = getCurrentUnixTimestamp();
+                std::string nonce = generateNonce();
+
+                std::ostringstream auth_request;
+                auth_request << "AUTH|" << std::fixed << std::setprecision(2) 
+                           << amount << "|" << unix_ts << "|" << nonce;
+                
+                if (!sendLine(client_socket, auth_request.str())) {
+                    std::cerr << "Failed to send AUTH request" << std::endl;
+                    close(client_socket);
+                    return false;
+                }
+
+                std::cout << "Sent: " << auth_request.str() << std::endl;
+
+                auto start_time = std::chrono::steady_clock::now();
+                std::string response;
+                
+                while (true) {
+                    auto current_time = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        current_time - start_time).count();
+                    
+                    if (elapsed >= 3000) { 
+                        if (!sendLine(client_socket, "PING")) {
+                            std::cerr << "Failed to send PING" << std::endl;
+                            break;
+                        }
+                        std::cout << "Sent: PING" << std::endl;
+                        start_time = current_time;
+                    }
+
+                    response = readLine(client_socket);
+                    response = stripCR(response);
+                    
+                    if (!response.empty()) {
+                        if (response == "PONG") {
+                            std::cout << "Received: PONG" << std::endl;
+                            start_time = std::chrono::steady_clock::now();
+                            continue;
+                        } else {
+                            std::cout << "Payment gateway response: " << response << std::endl;
+                            success = true;
+                            break;
+                        }
+                    }
+                    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+
+            } catch (const std::exception& e) {
+                std::cerr << "Exception during transaction: " << e.what() << std::endl;
+            }
+
             close(client_socket);
-            return false;
+            
+            if (success) {
+                return true;
+            }
+            
+            if (retries < max_retries) {
+                int delay_ms = 200 * (1 << retries); 
+                std::cout << "Transaction failed, retrying in " << delay_ms << "ms..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                retries++;
+            } else {
+                std::cerr << "Transaction failed after " << max_retries << " retries" << std::endl;
+                return false;
+            }
         }
-
-        std::cout << "Sent payment request: $" << std::fixed << std::setprecision(2) << amount << std::endl;
-
-        // Receive response
-        char buffer[1024] = {0};
-        ssize_t bytes_received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
-        if (bytes_received > 0) {
-            std::string response(buffer, bytes_received);
-            std::cout << "Payment gateway response: " << response << std::endl;
-        }
-
-        close(client_socket);
-        return true;
+        
+        return false;
     }
 };
 
 void printUsage(const char* program_name) {
     std::cout << "Usage: " << program_name << " <command> [options]" << std::endl;
     std::cout << "Commands:" << std::endl;
-    std::cout << "  server --port <port>                    Start payment gateway server" << std::endl;
+    std::cout << "  server --port <port>                    Start payment gateway terminal" << std::endl;
     std::cout << "  sale --amount <amount> --host <host> --port <port>  Send sale request" << std::endl;
     std::cout << std::endl;
     std::cout << "Examples:" << std::endl;
@@ -323,7 +657,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         
-        if (!POSGatewayClient::sendSaleRequest(host, port, amount)) {
+        POSGatewayClient client(host, port);
+        if (!client.sendSaleRequest(amount)) {
             return 1;
         }
         
